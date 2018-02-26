@@ -2,18 +2,22 @@
 
 ### Approach ###
 
- * Client submit job by creating a file in queue folder with append=True
- * On start-up, workers scan for unstarted tasks
- * Workers watch for new files come into the folder
-   * Each worker will try to acquire for the job by creating a lock file
-     since this is an atomic action, only one will get the job
-   * Worker executes the job and update status to success when it is done.
+Task submissions:
+ * Task submission is done by by creating a file in `tasks`.
+
+Task processing:
+ * Worker periodically scan for pending tasks.
+ * If there is no pending task, then it starts to watch for changes
+   * When there is new task, or there is change in states. Worker will try to acquire for the job by creating a lock filem, since this is an atomic action, only one will get the job
+   * Worker executes the task and update status to success when it is done.
    * During the execution, the worker must periodically refresh the ttl
+   * On failure, the worker should remove it locks to the file so other workers can acquire the task.
 
 ### Questions ###
 
  * How to handle failures?
  * How to handle "round-robin" behavior?
+ * How to cancel a task?
 
 ### References ###
 

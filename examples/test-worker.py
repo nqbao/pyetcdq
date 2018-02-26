@@ -10,6 +10,7 @@ worker.start()
 
 try:
     print ("Worker: %s" % worker._worker_key)
+
     while True:
         task = worker.acquire_task()
         print("process %s" % task)

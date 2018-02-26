@@ -24,6 +24,9 @@ class Worker(object):
         self._processing_tasks = queue.Queue(1)
 
     def start(self):
+        """
+        Start the worker
+        """
         assert not self._watch_thread, "Worker has already started."
         self._stop_event.clear()
 
@@ -75,6 +78,7 @@ class Worker(object):
             self._client.delete(state_key)
 
         self._log("Remove %s from processing list" % tid)
+        self._tasks.task_done()
         self._processing_tasks.get()
 
     def _watch(self):
@@ -114,7 +118,7 @@ class Worker(object):
 
     def _beat(self):
         while not self._stop_event.is_set():
-            # print "beat %s" % self._worker_key
+            # TODO: also do heartbeat for pending tasks
             if self._worker_key:
                 self._client.refresh(self._worker_key, ttl=TTL)
             time.sleep(TTL / 2)
@@ -162,8 +166,8 @@ class Worker(object):
     def lock_task(self, tid, ttl=TTL):
         lock_key = "%s/%s/%s" % (self._prefix, LOCK_PREFIX, tid)
 
+        self._client.write(lock_key, self._worker_key, ttl=ttl, prevExist=False)
         try:
-            self._client.write(lock_key, self._worker_key, ttl=ttl)
             yield
         finally:
             self._client.delete(lock_key)
