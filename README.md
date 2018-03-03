@@ -22,7 +22,7 @@ Task processing:
  * How to handle "round-robin" behavior?
  * How to cancel a task?: use process interupt
  * Capacity-based worker
- * Dependencis management (?)
+ * Task dependencies
  * Task priorities
  * Task retries
  * Error handling

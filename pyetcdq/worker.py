@@ -5,6 +5,7 @@ import etcd
 import threading
 import time
 import contextlib
+from datetime import datetime, timedelta
 from .const import LOCK_PREFIX, WORKER_PREFIX, TASK_PREFIX, STATE_PREFIX, RESULT_PREFIX, TTL
 from .task import Task
 
@@ -43,9 +44,9 @@ class Worker(object):
         while wait and self._heartbeat_thread:
             time.sleep(1)
 
-    def acquire_task(self):
+    def wait_for_task(self, timeout=None):
         """
-        Acquire a task from the pool. This will block until a task is acquired.
+        Wait for a task available. This will block until a task is available or timeout.
         """
         # try to acquire pending task first
         task = self._acquire_pending_task()
@@ -53,9 +54,19 @@ class Worker(object):
             return task
 
         # then try to watch for new tasks
+        start = datetime.now()
+        watch_timeout = 5
+
+        if timeout:
+            watch_timeout = timeout / 2
+            assert watch_timeout >= 1, "timeout is too small"
+
         while not task:
+            if timeout and (datetime.now() - start).seconds > timeout:
+                raise RuntimeError("Timeout while waiting for task")
+
             try:
-                result = self._client.watch(self._prefix, recursive=True, timeout=5)
+                result = self._client.watch(self._prefix, recursive=True, timeout=watch_timeout)
                 key = result.key[len(self._prefix) + 1:].split('/')
                 prefix = key[0]
                 tid = key[1]
@@ -67,7 +78,7 @@ class Worker(object):
                     self._log("Task is expired %s" % tid)
                     task = self._acquire_task(result)
                 else:
-                    print(result.action, key)
+                    self._log("Ignore event %s %s" % (result.action, key))
             except etcd.EtcdWatchTimedOut:
                 pass
 
@@ -129,8 +140,6 @@ class Worker(object):
         :rtype Task
         """
         task = self._task(result)
-
-        # TODO: ignore if task is acquired by current worker
 
         # try to lock state key
         try:

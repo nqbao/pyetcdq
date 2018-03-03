@@ -1,2 +1,4 @@
 etcd-data
 *.pyc
+cover
+.coverage
