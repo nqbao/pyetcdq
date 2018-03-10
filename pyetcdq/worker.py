@@ -18,6 +18,7 @@ class Worker(object):
         self._heartbeat_thread = None
         self._worker_key = None
         self._stop_event = threading.Event()
+        self._acquired_tasks = {}
 
     def start(self):
         """
@@ -67,6 +68,7 @@ class Worker(object):
                 raise RuntimeError("Timeout while waiting for task")
 
             try:
+                # ideally, we should watch for the queues folder
                 result = self._etcd.watch(self._prefix, recursive=True, timeout=watch_timeout)
                 key = result.key[len(self._prefix) + 1:].split('/')
                 prefix = key[0]
@@ -100,14 +102,17 @@ class Worker(object):
         """
         Release the task from current worker
         """
+        # TODO: validate if this task was really acquired by us
         assert task
         self._log("Remove %s from processing list" % task.tid)
         self._etcd.delete(self._key(QUEUE_PREFIX, task.tid))
+        del self._acquired_tasks[task.tid]
 
     def finish_task(self, task, result=None, error=None):
         """
         Mark a task as finish and also release it
         """
+        # TODO: validate if this task was really acquired by us
         assert task
         self._log("Finishing task %s" % task.tid)
         with self._client.lock_task(task):
@@ -130,6 +135,15 @@ class Worker(object):
             # TODO: also do heartbeat for pending tasks
             if self._worker_key:
                 self._etcd.refresh(self._worker_key, ttl=TTL)
+
+            acquired_tasks = self._acquired_tasks.keys()
+            if acquired_tasks:
+                for tid in acquired_tasks:
+                    try:
+                        self._etcd.refresh(self._key(TASK_PREFIX, tid, "state"), ttl=TTL)
+                    except Exception as ex:
+                        self._log("Unable to refresh task %s: %s" % (tid, ex))
+
             time.sleep(TTL / 2)
 
     def _acquire_pending_task(self):
@@ -163,6 +177,7 @@ class Worker(object):
         try:
             state_key = self._key(TASK_PREFIX, task.tid, "state")
             self._etcd.write(state_key, json.dumps("ACQUIRED"), prevExist=False, ttl=TTL)
+            self._acquired_tasks[task.tid] = task
 
             self._log("Task %s acquired successfully" % task.tid)
             return task
