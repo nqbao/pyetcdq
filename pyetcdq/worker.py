@@ -4,16 +4,17 @@ from __future__ import print_function
 import etcd
 import threading
 import time
-import contextlib
-from datetime import datetime, timedelta
-from .const import LOCK_PREFIX, WORKER_PREFIX, TASK_PREFIX, STATE_PREFIX, RESULT_PREFIX, TTL
-from .task import Task
+import json
+from datetime import datetime
+from .const import WORKER_PREFIX, TASK_PREFIX, QUEUE_PREFIX, TTL
+from .client import Client
 
 
 class Worker(object):
     def __init__(self, etcd_client, prefix):
-        self._client = etcd_client
+        self._etcd = etcd_client
         self._prefix = prefix
+        self._client = Client(self._etcd, prefix)
         self._heartbeat_thread = None
         self._worker_key = None
         self._stop_event = threading.Event()
@@ -25,7 +26,7 @@ class Worker(object):
         self._stop_event.clear()
 
         # register myself to worker list
-        self._worker_key = self._client.write("%s/%s" % (self._prefix, WORKER_PREFIX), "", append=True, ttl=TTL * 2).key
+        self._worker_key = self._etcd.write(self._key(WORKER_PREFIX), "", append=True, ttl=TTL * 2).key
 
         self._heartbeat_thread = threading.Thread(target=self._beat)
         self._heartbeat_thread.daemon = True
@@ -38,7 +39,7 @@ class Worker(object):
         Stop worker
         """
         self._stop_event.set()
-        self._client.delete(self._worker_key)
+        self._etcd.delete(self._worker_key)
 
         # wait until the thread exit
         while wait and self._heartbeat_thread:
@@ -66,17 +67,28 @@ class Worker(object):
                 raise RuntimeError("Timeout while waiting for task")
 
             try:
-                result = self._client.watch(self._prefix, recursive=True, timeout=watch_timeout)
+                result = self._etcd.watch(self._prefix, recursive=True, timeout=watch_timeout)
                 key = result.key[len(self._prefix) + 1:].split('/')
                 prefix = key[0]
-                tid = key[1]
 
-                if result.action == 'create' and prefix == TASK_PREFIX:
-                    self._log("Got new task %s" % tid)
+                if prefix == QUEUE_PREFIX and result.action in ('create', 'set'):
+                    self._log("Got new task %s" % result.value)
                     task = self._acquire_task(result)
-                elif result.action == 'expire' and prefix == STATE_PREFIX:
-                    self._log("Task is expired %s" % tid)
-                    task = self._acquire_task(result)
+                elif prefix == TASK_PREFIX and result.action == 'expire':
+                    # this means a the task is lost, try to rerun it
+                    if key[-1] == 'state':
+                        self._log("Task %s is lost, try to acquire it" % key[1])
+                        task = self._acquire_pending_task()
+                elif prefix == WORKER_PREFIX:
+                    tid = key[1]
+                    if result.action == 'create':
+                        self._log('New worker joins: %s' % tid)
+                    elif result.action == 'expire':
+                        self._log('Worker %s is lost' % tid)
+                    elif result.action == 'delete':
+                        self._log('Worker %s leaves' % tid)
+                    else:
+                        self._log("Ignore worker event: %s %s" % (result.action, key))
                 else:
                     self._log("Ignore event %s %s" % (result.action, key))
             except etcd.EtcdWatchTimedOut:
@@ -90,21 +102,26 @@ class Worker(object):
         """
         assert task
         self._log("Remove %s from processing list" % task.tid)
-        self._client.delete(self._key(STATE_PREFIX, task.tid))
+        self._etcd.delete(self._key(QUEUE_PREFIX, task.tid))
 
-    def finish_task(self, task, result=None):
+    def finish_task(self, task, result=None, error=None):
         """
         Mark a task as finish and also release it
         """
         assert task
         self._log("Finishing task %s" % task.tid)
-        with self.lock_task(task):
+        with self._client.lock_task(task):
             # XXX: this is not atomic, any of this could fail
-            task_key = "%s/%s/%s" % (self._prefix, TASK_PREFIX, task.tid)
-            result_key = "%s/%s/%s" % (self._prefix, RESULT_PREFIX, task.tid)
+            result_key = self._key(TASK_PREFIX, task.tid, "result")
+            state_key = self._key(TASK_PREFIX, task.tid, "state")
+            error_key = self._key(TASK_PREFIX, task.tid, "error")
 
-            self._client.write(result_key, result)
-            self._client.delete(task_key)
+            if error:
+                self._etcd.write(error_key, json.dumps(error))
+                self._etcd.write(state_key, json.dumps('FAILURE'))
+            else:
+                self._etcd.write(result_key, json.dumps(result))
+                self._etcd.write(state_key, json.dumps('SUCCESS'))
 
         self.release_task(task)
 
@@ -112,14 +129,14 @@ class Worker(object):
         while not self._stop_event.is_set():
             # TODO: also do heartbeat for pending tasks
             if self._worker_key:
-                self._client.refresh(self._worker_key, ttl=TTL)
+                self._etcd.refresh(self._worker_key, ttl=TTL)
             time.sleep(TTL / 2)
 
     def _acquire_pending_task(self):
-        # try to acquire any pending task
+        # try to acquire any pending task in queue
         result = None
         try:
-            result = self._client.read(self._key(TASK_PREFIX))
+            result = self._etcd.read(self._key(QUEUE_PREFIX))
         except etcd.EtcdKeyNotFound:
             # there is no task yet, just move on
             return
@@ -139,12 +156,13 @@ class Worker(object):
 
         :rtype Task
         """
-        task = self._task(result)
+        queue_data = json.loads(result.value)
+        task = self._client.get_task(queue_data.get('id'))
 
         # try to lock state key
         try:
-            state_key = self._key(STATE_PREFIX, task.tid)
-            self._client.write(state_key, "STARTED", prevExist=False, ttl=TTL)
+            state_key = self._key(TASK_PREFIX, task.tid, "state")
+            self._etcd.write(state_key, json.dumps("ACQUIRED"), prevExist=False, ttl=TTL)
 
             self._log("Task %s acquired successfully" % task.tid)
             return task
@@ -153,29 +171,9 @@ class Worker(object):
             self._log("Task %s is already acquired" % task.tid)
             return
 
-    @contextlib.contextmanager
-    def lock_task(self, task, ttl=TTL):
-        tid = task.tid
-        lock_key = self._key(LOCK_PREFIX, tid)
-
-        self._client.write(lock_key, self._worker_key, ttl=ttl, prevExist=False)
-        try:
-            yield
-        finally:
-            self._client.delete(lock_key)
-
     def _key(self, *args):
         return "%s/%s" % (self._prefix, "/".join(args))
 
     @staticmethod
     def _log(msg):
         print(msg)
-
-    @staticmethod
-    def _task(etcd_result):
-        """
-        Helper method to create task from etcd result
-
-        :rtype Task
-        """
-        return Task(etcd_result.key, etcd_result.value)

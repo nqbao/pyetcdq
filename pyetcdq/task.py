@@ -2,15 +2,10 @@ class Task(object):
     """
     Task object
     """
-    def __init__(self, key, data, result=None):
-        self._key = key
-        self._tid = key.split('/')[-1]
+    def __init__(self, tid, data=None, result=None):
+        self._tid = tid
         self.data = data or {}
         self.result = result
-
-    @property
-    def key(self):
-        return self._key
 
     @property
     def tid(self):

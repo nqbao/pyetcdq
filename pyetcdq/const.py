@@ -1,6 +1,5 @@
 TASK_PREFIX = "tasks"
-STATE_PREFIX = "states"
+QUEUE_PREFIX = "queues"
 WORKER_PREFIX = "workers"
-LOCK_PREFIX = "locks"
-RESULT_PREFIX = "results"
+
 TTL = 30
